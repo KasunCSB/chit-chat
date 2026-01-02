@@ -4,6 +4,7 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Server as SocketIOServer } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
 import Redis from 'ioredis';
 import QRCode from 'qrcode';
 import { nanoid } from 'nanoid';
@@ -408,6 +409,16 @@ const io = new SocketIOServer(httpServer, {
   pingTimeout: 20000,
   pingInterval: 10000,
 });
+
+// Redis adapter for multi-server Socket.IO (pub/sub for cross-VM communication)
+const pubClient = new Redis(REDIS_URL);
+const subClient = pubClient.duplicate();
+
+pubClient.on('error', (err) => console.error(`[${SERVER_ID}] redis pub error:`, err?.message));
+subClient.on('error', (err) => console.error(`[${SERVER_ID}] redis sub error:`, err?.message));
+
+io.adapter(createAdapter(pubClient, subClient));
+console.log(`[${SERVER_ID}] Socket.IO Redis adapter enabled for multi-VM pub/sub`);
 
 // Helper: Get room data
 async function getRoom(roomId) {
