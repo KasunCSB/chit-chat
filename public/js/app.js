@@ -10,6 +10,37 @@
 // Example: 'https://your-chitchat.azurefd.net'
 const API_BASE_URL = window.CHITCHAT_API_URL || '';
 
+// Persist current room session so a reconnect (or reload during failover) can rejoin.
+const SESSION_STORAGE_KEY = 'chitchat:session';
+
+function saveRoomSession() {
+  if (!state.roomId || !state.memberId) return;
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+      roomId: state.roomId,
+      memberId: state.memberId,
+      savedAt: Date.now(),
+    }));
+  } catch {}
+}
+
+function loadRoomSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.roomId || !parsed?.memberId) return;
+    state.roomId = parsed.roomId;
+    state.memberId = parsed.memberId;
+  } catch {}
+}
+
+function clearRoomSession() {
+  try {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {}
+}
+
 // ==========================================================================
 // Avatars
 // ==========================================================================
@@ -397,6 +428,8 @@ function initSocket() {
     state.room = data.room;
     state.isAdmin = data.isAdmin;
     state.members = data.members || [];
+
+    saveRoomSession();
     
     console.log('State updated:', { roomId: state.roomId, memberId: state.memberId, isAdmin: state.isAdmin, isRejoin });
     
@@ -959,6 +992,7 @@ function resetRoomState() {
   state.isAdmin = false;
   state.members = [];
   elements.chatMessages.innerHTML = '';
+  clearRoomSession();
 }
 
 function formatTime(timestamp) {
@@ -1281,6 +1315,10 @@ function handleDirectJoin() {
 function init() {
   renderAvatarGrid();
   setupEventListeners();
+
+  // Restore a previous room session (used for failover + reload resilience)
+  loadRoomSession();
+
   initSocket();
   
   // Handle page visibility

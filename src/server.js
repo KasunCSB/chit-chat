@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
 import Redis from 'ioredis';
+import { createClient as createNodeRedisClient } from 'redis';
 import QRCode from 'qrcode';
 import { nanoid } from 'nanoid';
 import { generatePassphrase, normalizePassphrase } from './wordlist.js';
@@ -33,6 +34,11 @@ const RECENT_MESSAGES_LIMIT = Number(process.env.RECENT_MESSAGES_LIMIT || 200);
 const TRUST_PROXY = envBool(process.env.TRUST_PROXY, true);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
+// HA tuning (safe defaults)
+const RECONNECT_GRACE_SECONDS = Number(process.env.RECONNECT_GRACE_SECONDS || 30);
+const PRESENCE_HEARTBEAT_MS = Number(process.env.PRESENCE_HEARTBEAT_MS || 5000);
+const PRESENCE_STALE_MS = Number(process.env.PRESENCE_STALE_MS || 15000);
+
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 15_000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 80);
 
@@ -51,6 +57,9 @@ const keys = {
   recent: (id) => `room:${id}:recent`,
   msgId: (id, clientMsgId) => `room:${id}:msgid:${clientMsgId}`,
   typing: (id) => `room:${id}:typing`,
+  presence: (id) => `room:${id}:presence`,
+  disconnected: (id) => `room:${id}:disconnected`,
+  activeRooms: () => 'rooms:active',
 };
 
 // CORS configuration for split frontend/backend deployment
@@ -410,15 +419,28 @@ const io = new SocketIOServer(httpServer, {
   pingInterval: 10000,
 });
 
-// Redis adapter for multi-server Socket.IO (pub/sub for cross-VM communication)
-const pubClient = new Redis(REDIS_URL);
-const subClient = pubClient.duplicate();
+// IMPORTANT: @socket.io/redis-adapter expects node-redis clients (not ioredis).
+let socketRedisPub = null;
+let socketRedisSub = null;
 
-pubClient.on('error', (err) => console.error(`[${SERVER_ID}] redis pub error:`, err?.message));
-subClient.on('error', (err) => console.error(`[${SERVER_ID}] redis sub error:`, err?.message));
+async function setupSocketRedisAdapter() {
+  if (socketRedisPub && socketRedisSub) return;
 
-io.adapter(createAdapter(pubClient, subClient));
-console.log(`[${SERVER_ID}] Socket.IO Redis adapter enabled for multi-VM pub/sub`);
+  const pub = createNodeRedisClient({ url: REDIS_URL });
+  const sub = pub.duplicate();
+
+  pub.on('error', (err) => console.error(`[${SERVER_ID}] socket redis pub error:`, err?.message || err));
+  sub.on('error', (err) => console.error(`[${SERVER_ID}] socket redis sub error:`, err?.message || err));
+
+  await pub.connect();
+  await sub.connect();
+
+  io.adapter(createAdapter(pub, sub));
+  socketRedisPub = pub;
+  socketRedisSub = sub;
+
+  console.log(`[${SERVER_ID}] Socket.IO Redis adapter enabled (node-redis pub/sub)`);
+}
 
 // Helper: Get room data
 async function getRoom(roomId) {
@@ -437,6 +459,12 @@ async function saveRoom(room) {
   await redis.set(keys.room(room.id), JSON.stringify(room), 'EX', ROOM_TTL_SECONDS);
 }
 
+async function trackActiveRoom(roomId) {
+  // Best-effort: keep a small index of rooms to reconcile presence/cleanup.
+  // Rooms are removed from this set when the room key expires.
+  await redis.sadd(keys.activeRooms(), roomId);
+}
+
 // Helper: Refresh all room TTLs
 async function refreshRoomTTL(roomId) {
   const pipeline = redis.pipeline();
@@ -445,7 +473,57 @@ async function refreshRoomTTL(roomId) {
   pipeline.expire(keys.seq(roomId), ROOM_TTL_SECONDS);
   pipeline.expire(keys.recent(roomId), ROOM_TTL_SECONDS);
   pipeline.expire(keys.typing(roomId), ROOM_TTL_SECONDS);
+  pipeline.expire(keys.presence(roomId), ROOM_TTL_SECONDS);
+  pipeline.expire(keys.disconnected(roomId), ROOM_TTL_SECONDS);
   await pipeline.exec();
+}
+
+async function setPresence(roomId, memberId) {
+  await redis.hset(keys.presence(roomId), memberId, String(nowMs()));
+  await redis.expire(keys.presence(roomId), ROOM_TTL_SECONDS);
+}
+
+function startPresenceHeartbeat(socket, roomId, memberId) {
+  if (socket.data?.presenceTimer) {
+    clearInterval(socket.data.presenceTimer);
+  }
+  socket.data.presenceTimer = setInterval(() => {
+    setPresence(roomId, memberId).catch(() => {});
+  }, PRESENCE_HEARTBEAT_MS);
+}
+
+function stopPresenceHeartbeat(socket) {
+  if (socket?.data?.presenceTimer) {
+    clearInterval(socket.data.presenceTimer);
+    socket.data.presenceTimer = null;
+  }
+}
+
+async function markMemberDisconnected(roomId, memberId, reason = 'disconnect') {
+  const existing = await redis.hget(keys.members(roomId), memberId);
+  if (!existing) return;
+
+  let member;
+  try {
+    member = JSON.parse(existing);
+  } catch {
+    return;
+  }
+
+  if (!member || !member.id) return;
+  if (member.disconnectedAt && !member.odId) return; // already disconnected
+
+  member.disconnectedAt = nowMs();
+  member.odId = null;
+  await redis.hset(keys.members(roomId), memberId, JSON.stringify(member));
+  await redis.zadd(keys.disconnected(roomId), member.disconnectedAt, memberId);
+  await redis.expire(keys.disconnected(roomId), ROOM_TTL_SECONDS);
+
+  // Typing should clear immediately.
+  await redis.hdel(keys.typing(roomId), memberId);
+  await refreshRoomTTL(roomId);
+
+  console.log(`[${SERVER_ID}] Marked member disconnected (${reason}) room=${roomId} member=${memberId}`);
 }
 
 // Helper: Get all members (with connection status for UI)
@@ -461,6 +539,103 @@ async function getMembers(roomId) {
     } catch {}
   }
   return members;
+}
+
+async function reconcileRoomPresence(roomId) {
+  const now = nowMs();
+  const presence = await redis.hgetall(keys.presence(roomId));
+  const membersData = await redis.hgetall(keys.members(roomId));
+
+  for (const [memberId, json] of Object.entries(membersData)) {
+    let member;
+    try {
+      member = JSON.parse(json);
+    } catch {
+      continue;
+    }
+    if (!member || !member.id) continue;
+
+    // If member appears connected (has odId) but we haven't seen a presence heartbeat recently,
+    // assume their VM died / connection is stuck and mark as reconnecting.
+    if (member.odId && !member.disconnectedAt) {
+      const lastSeen = Number(presence[memberId] || 0);
+      if (!lastSeen || now - lastSeen > PRESENCE_STALE_MS) {
+        await markMemberDisconnected(roomId, memberId, 'presence-timeout');
+      }
+    }
+  }
+}
+
+async function cleanupExpiredDisconnected(roomId) {
+  const now = nowMs();
+  const cutoff = now - RECONNECT_GRACE_SECONDS * 1000;
+  const expired = await redis.zrangebyscore(keys.disconnected(roomId), 0, cutoff);
+  if (!expired || expired.length === 0) return;
+
+  // Remove each expired member and rotate admin if needed.
+  for (const memberId of expired) {
+    const existing = await redis.hget(keys.members(roomId), memberId);
+    let departing = null;
+    if (existing) {
+      try { departing = JSON.parse(existing); } catch {}
+    }
+
+    await redis.hdel(keys.members(roomId), memberId);
+    await redis.hdel(keys.typing(roomId), memberId);
+    await redis.hdel(keys.presence(roomId), memberId);
+    await redis.zrem(keys.disconnected(roomId), memberId);
+
+    // If admin expired, rotate to earliest joined *connected* member.
+    if (departing?.role === 'admin') {
+      const remaining = await getMembers(roomId);
+      const candidates = remaining.filter((m) => m && m.id && m.status !== 'reconnecting');
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+        const newAdmin = candidates[0];
+        newAdmin.role = 'admin';
+        await redis.hset(keys.members(roomId), newAdmin.id, JSON.stringify(newAdmin));
+
+        const room = await getRoom(roomId);
+        if (room) {
+          room.adminId = newAdmin.id;
+          await saveRoom(room);
+        }
+
+        io.to(roomId).emit('member:promoted', { memberId: newAdmin.id, name: newAdmin.name });
+        io.to(roomId).emit('room:admin-changed', { adminId: newAdmin.id, adminName: newAdmin.name });
+      }
+    }
+
+    if (departing?.name) {
+      io.to(roomId).emit('member:left', { memberId, name: departing.name });
+      io.to(roomId).emit('room:notice', { message: `${departing.name} left`, type: 'leave', ts: nowMs() });
+    }
+  }
+
+  await broadcastMembers(roomId);
+  await broadcastTyping(roomId);
+}
+
+let clusterReconcileTimer = null;
+
+function startClusterReconcileLoop() {
+  if (clusterReconcileTimer) return;
+  clusterReconcileTimer = setInterval(() => {
+    (async () => {
+      const rooms = await redis.smembers(keys.activeRooms());
+      if (!rooms || rooms.length === 0) return;
+
+      for (const roomId of rooms) {
+        const exists = await redis.exists(keys.room(roomId));
+        if (!exists) {
+          await redis.srem(keys.activeRooms(), roomId);
+          continue;
+        }
+        await reconcileRoomPresence(roomId);
+        await cleanupExpiredDisconnected(roomId);
+      }
+    })().catch((err) => console.error(`[${SERVER_ID}] reconcile loop error:`, err?.message || err));
+  }, 5000);
 }
 
 // Helper: Get recent messages
@@ -581,6 +756,9 @@ io.on('connection', (socket) => {
       member.odId = socket.id;
       member.disconnectedAt = null; // Clear disconnect timestamp - member is back!
       await redis.hset(keys.members(roomId), memberId, JSON.stringify(member));
+      await redis.zrem(keys.disconnected(roomId), memberId);
+      await trackActiveRoom(roomId);
+      await setPresence(roomId, memberId);
       await refreshRoomTTL(roomId);
       
       console.log(`[${SERVER_ID}] Member ${member.name} rejoined room ${roomId} after failover`);
@@ -590,6 +768,8 @@ io.on('connection', (socket) => {
       socket.data.memberName = member.name;
       socket.data.memberRole = member.role;
       await socket.join(roomId);
+
+      startPresenceHeartbeat(socket, roomId, memberId);
 
       // Get current members and recent messages for the rejoining client
       const members = await getMembers(roomId);
@@ -692,7 +872,11 @@ io.on('connection', (socket) => {
 
       // Add to Redis members
       await redis.hset(keys.members(roomId), memberId, JSON.stringify(member));
+      await trackActiveRoom(roomId);
+      await setPresence(roomId, memberId);
       await refreshRoomTTL(roomId);
+
+      startPresenceHeartbeat(socket, roomId, memberId);
 
       // Get recent messages
       const recent = await getRecentMessages(roomId);
@@ -810,6 +994,23 @@ io.on('connection', (socket) => {
         return ack?.({ ok: false, error: 'Chat has not started yet' });
       }
 
+      // Membership check (critical for multi-VM kicks/room close)
+      const memberData = await redis.hget(keys.members(roomId), memberId);
+      if (!memberData) {
+        try {
+          await redis.hdel(keys.typing(roomId), memberId);
+        } catch (_) {
+          // ignore
+        }
+        try {
+          await socket.leave(roomId);
+        } catch (_) {
+          // ignore
+        }
+        socket.data = {};
+        return ack?.({ ok: false, error: 'Not a member of this room' });
+      }
+
       // Idempotency check
       if (clientMsgId) {
         const exists = await redis.set(keys.msgId(roomId, clientMsgId), '1', 'EX', ROOM_TTL_SECONDS, 'NX');
@@ -822,23 +1023,23 @@ io.on('connection', (socket) => {
       const seq = await redis.incr(keys.seq(roomId));
 
       // Build message
-      const memberData = await redis.hget(keys.members(roomId), memberId);
       let member = null;
       let senderName = memberName || 'Unknown';
       let senderAvatar = null;
       
-      if (memberData) {
-        try {
-          member = JSON.parse(memberData);
-          if (member) {
-            senderName = member.name || senderName;
-            senderAvatar = member.avatar || null;
-          }
-        } catch (parseErr) {
-          console.error('Failed to parse member data:', parseErr);
-          // Continue with defaults
-        }
+      try {
+        member = JSON.parse(memberData);
+      } catch (parseErr) {
+        console.error('Failed to parse member data:', parseErr);
+        return ack?.({ ok: false, error: 'Invalid member data' });
       }
+
+      if (!member || member.id !== memberId) {
+        return ack?.({ ok: false, error: 'Invalid member' });
+      }
+
+      senderName = member.name || senderName;
+      senderAvatar = member.avatar || null;
 
       const msg = {
         seq,
@@ -855,6 +1056,8 @@ io.on('connection', (socket) => {
       await redis.lpush(keys.recent(roomId), JSON.stringify(msg));
       await redis.ltrim(keys.recent(roomId), 0, RECENT_MESSAGES_LIMIT - 1);
       await refreshRoomTTL(roomId);
+
+      await trackActiveRoom(roomId);
 
       // Broadcast (support both event names)
       io.to(roomId).emit('message:new', msg);
@@ -876,6 +1079,20 @@ io.on('connection', (socket) => {
     const { roomId, memberName, memberId } = socket.data || {};
     if (!roomId || !memberId) return;
 
+    const room = await getRoom(roomId);
+    if (!room || room.status === 'closed') return;
+
+    const memberData = await redis.hget(keys.members(roomId), memberId);
+    if (!memberData) {
+      try {
+        await socket.leave(roomId);
+      } catch (_) {
+        // ignore
+      }
+      socket.data = {};
+      return;
+    }
+
     await redis.hset(keys.typing(roomId), memberId, JSON.stringify({ name: memberName, ts: nowMs() }));
     // Ensure the typing key has TTL set (in case it's the first entry)
     await redis.expire(keys.typing(roomId), ROOM_TTL_SECONDS);
@@ -885,6 +1102,20 @@ io.on('connection', (socket) => {
   socket.on('typing:stop', async () => {
     const { roomId, memberId } = socket.data || {};
     if (!roomId || !memberId) return;
+
+    const room = await getRoom(roomId);
+    if (!room || room.status === 'closed') return;
+
+    const memberData = await redis.hget(keys.members(roomId), memberId);
+    if (!memberData) {
+      try {
+        await socket.leave(roomId);
+      } catch (_) {
+        // ignore
+      }
+      socket.data = {};
+      return;
+    }
 
     await redis.hdel(keys.typing(roomId), memberId);
     await broadcastTyping(roomId);
@@ -946,16 +1177,19 @@ io.on('connection', (socket) => {
       // Remove from Redis (use actualTargetId which is guaranteed to be set)
       await redis.hdel(keys.members(roomId), actualTargetId);
 
-      // Force disconnect the target socket
-      const targetSocket = io.sockets.sockets.get(target.odId);
-      if (targetSocket) {
-        targetSocket.emit('member:kicked', {
+      // Clean up any HA/presence-related state for this member
+      await redis.hdel(keys.presence(roomId), target.id);
+      await redis.zrem(keys.disconnected(roomId), target.id);
+      await redis.hdel(keys.typing(roomId), target.id);
+
+      // Notify and remove the target socket from the room (must work cross-VM)
+      if (target.odId) {
+        io.to(target.odId).emit('member:kicked', {
           memberId: target.id,
           name: target.name,
           kickedBy: socket.data.memberName,
         });
-        targetSocket.leave(roomId);
-        targetSocket.data = {};
+        await io.in(target.odId).socketsLeave(roomId);
       }
 
       io.to(roomId).emit('member:kicked', {
@@ -1058,11 +1292,9 @@ io.on('connection', (socket) => {
         await saveRoom(room);
       }
 
-      // Update target socket data
-      const targetSocket = io.sockets.sockets.get(target.odId);
-      if (targetSocket) {
-        targetSocket.data.memberRole = 'admin';
-        targetSocket.emit('member:promoted', { memberId: target.id, name: target.name });
+      // Notify the target connection (must work cross-VM)
+      if (target.odId) {
+        io.to(target.odId).emit('member:promoted', { memberId: target.id, name: target.name });
       }
 
       systemNotice(roomId, `${target.name} is now the admin`, 'promote');
@@ -1107,12 +1339,8 @@ io.on('connection', (socket) => {
 
       io.to(roomId).emit('room:closed', { reason: 'Room closed by admin', ts: nowMs() });
 
-      // Disconnect all sockets in the room
-      const sockets = await io.in(roomId).fetchSockets();
-      for (const s of sockets) {
-        s.leave(roomId);
-        s.data = {};
-      }
+      // Remove all sockets from the room (adapter-safe across VMs)
+      await io.in(roomId).socketsLeave(roomId);
 
       ack?.({ ok: true });
     } catch (err) {
@@ -1122,92 +1350,17 @@ io.on('connection', (socket) => {
 
   // Handle disconnect - use grace period for HA (allows reconnection during failover)
   socket.on('disconnect', async () => {
-    // Safely extract socket data with proper null checks
-    if (!socket.data) {
-      console.log('Disconnect: socket has no data');
-      return;
-    }
-    const { roomId, memberName, memberId, memberRole } = socket.data;
-    if (!roomId || !memberId) {
-      console.log('Disconnect: missing roomId or memberId');
-      return;
-    }
-    
-    const safeMemberName = memberName || 'Someone';
-    const RECONNECT_GRACE_SECONDS = 30; // Allow 30s for reconnection
-
     try {
-      // Mark member as disconnected but DON'T remove yet (grace period for HA)
-      const memberData = await redis.hget(keys.members(roomId), memberId);
-      if (memberData) {
-        try {
-          const member = JSON.parse(memberData);
-          member.disconnectedAt = nowMs();
-          member.odId = null; // Clear socket ID
-          await redis.hset(keys.members(roomId), memberId, JSON.stringify(member));
-          
-          // Schedule cleanup after grace period
-          setTimeout(async () => {
-            try {
-              const currentData = await redis.hget(keys.members(roomId), memberId);
-              if (currentData) {
-                const current = JSON.parse(currentData);
-                // Only remove if still disconnected (not reconnected)
-                if (current.disconnectedAt && !current.odId) {
-                  console.log(`[${SERVER_ID}] Grace period expired for ${safeMemberName}, removing from room`);
-                  await redis.hdel(keys.members(roomId), memberId);
-                  await redis.hdel(keys.typing(roomId), memberId);
-                  
-                  // Notify others
-                  io.to(roomId).emit('member:left', { memberId, name: safeMemberName });
-                  io.to(roomId).emit('room:notice', {
-                    message: `${safeMemberName} left`,
-                    type: 'leave',
-                    ts: nowMs(),
-                  });
-                  
-                  // Handle admin rotation if needed
-                  const members = await getMembers(roomId);
-                  if (memberRole === 'admin' && members.length > 0) {
-                    const validMembers = members.filter(m => m && m.id && !m.disconnectedAt);
-                    if (validMembers.length > 0) {
-                      const sortedMembers = validMembers.sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
-                      const newAdmin = sortedMembers[0];
-                      newAdmin.role = 'admin';
-                      await redis.hset(keys.members(roomId), newAdmin.id, JSON.stringify(newAdmin));
-                      
-                      const room = await getRoom(roomId);
-                      if (room) {
-                        room.adminId = newAdmin.id;
-                        await saveRoom(room);
-                      }
-                      
-                      io.to(roomId).emit('member:promoted', { memberId: newAdmin.id, name: newAdmin.name });
-                      io.to(roomId).emit('room:admin-changed', { adminId: newAdmin.id, adminName: newAdmin.name });
-                      systemNotice(roomId, `${newAdmin.name} is now the admin`, 'promote');
-                    }
-                  }
-                  
-                  await broadcastMembers(roomId);
-                }
-              }
-            } catch (cleanupErr) {
-              console.error('Grace period cleanup error:', cleanupErr);
-            }
-          }, RECONNECT_GRACE_SECONDS * 1000);
-          
-        } catch (parseErr) {
-          console.error('Failed to parse member data on disconnect:', parseErr);
-        }
-      }
+      stopPresenceHeartbeat(socket);
 
-      // Clear typing immediately
-      await redis.hdel(keys.typing(roomId), memberId);
-      await broadcastTyping(roomId);
-      
-      // Broadcast updated members (shows as "reconnecting" status)
+      if (!socket.data) return;
+      const { roomId, memberId } = socket.data;
+      if (!roomId || !memberId) return;
+
+      await trackActiveRoom(roomId);
+      await markMemberDisconnected(roomId, memberId, 'socket-disconnect');
       await broadcastMembers(roomId);
-      
+      await broadcastTyping(roomId);
     } catch (err) {
       console.error('Disconnect handler error:', err);
     }
@@ -1228,10 +1381,20 @@ async function main() {
     process.exit(1);
   }
 
+  try {
+    await setupSocketRedisAdapter();
+  } catch (e) {
+    console.error(`[${SERVER_ID}] Failed to enable Socket.IO Redis adapter`);
+    console.error(`[${SERVER_ID}] Error: ${e?.message || e}`);
+    process.exit(1);
+  }
+
   httpServer.listen(PORT, HOST, () => {
     console.log(`[${SERVER_ID}] Server listening on :${PORT}`);
     console.log(`[${SERVER_ID}] Base URL: ${BASE_URL}`);
   });
+
+  startClusterReconcileLoop();
 
   const shutdown = async (signal) => {
     try {
@@ -1240,6 +1403,8 @@ async function main() {
         console.log(`[${SERVER_ID}] http server closed`);
       });
       await redis.quit();
+      await socketRedisPub?.quit?.();
+      await socketRedisSub?.quit?.();
     } catch (err) {
       console.error(`[${SERVER_ID}] shutdown error:`, err?.message || err);
     } finally {
