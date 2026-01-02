@@ -20,7 +20,7 @@
 
 ## Live Demo
 
-- **Primary**: [chit-chat.web.app](https://chit-chat.web.app) (Firebase + backend)
+- **Primary**: [chit-chat-g7.web.app](https://chit-chat-g7.web.app) (Firebase + backend)
 - **Fallback**: [cc.kasunc.live](https://cc.kasunc.live) (Direct backend)
 
 ## Architecture
@@ -74,7 +74,7 @@
 
 | URL | Path | Use Case |
 |-----|------|----------|
-| `chit-chat.web.app` | Firebase → API to cc.kasunc.live | Primary |
+| `chit-chat-g7.web.app` | Firebase → API to cc.kasunc.live | Primary (team-neutral) |
 | `cc.kasunc.live` | Direct to backend (serves FE + API) | Fallback if Firebase down |
 
 ## Quick Start
@@ -190,11 +190,12 @@ npm run smoke
 
 | Component | Service |
 |-----------|--------|
-| Frontend | Firebase Hosting (`chit-chat.web.app`) |
-| Edge/SSL | Cloudflare (Free tier) |
+| Frontend | Firebase Hosting (`chit-chat-g7.web.app`) |
+| Edge/SSL | Cloudflare (Free tier, Full strict) |
 | Load Balancer | nginx on Oracle Cloud VM |
 | App Servers | 2x Azure VMs (round-robin) |
-| Database | Azure Cache for Redis (Standard C0) |
+| Session Store | Azure Cache for Redis (Standard C0, TLS) |
+| Health Monitor | Status Aggregator on Oracle VM (PM2) |
 | Domain | `cc.kasunc.live` (Cloudflare DNS) |
 
 ### Deploy to VMs
