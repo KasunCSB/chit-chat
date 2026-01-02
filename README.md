@@ -81,7 +81,7 @@
 
 | URL | Path | Use Case |
 |-----|------|----------|
-| `chit-chat-g7.web.app` | Firebase → API to cc.kasunc.live | Primary (team-neutral) |
+| `chit-chat-g7.web.app` | Firebase → API to cc.kasunc.live | Primary                |
 | `cc.kasunc.live` | Direct to backend (serves FE + API) | Fallback if Firebase down |
 
 ## Quick Start
@@ -247,4 +247,4 @@ firebase deploy --only hosting
 
 ## License
 
-MIT
+MIT — See LICENSE for details.
