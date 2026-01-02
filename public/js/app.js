@@ -351,7 +351,12 @@ const elements = {
   modalLink: document.getElementById('modal-link'),
   modalQr: document.getElementById('modal-qr'),
   modalCopyCode: document.getElementById('modal-copy-code'),
-  modalCopyLink: document.getElementById('modal-copy-link')
+  modalCopyLink: document.getElementById('modal-copy-link'),
+
+  // Confirm Close Modal
+  confirmCloseModal: document.getElementById('confirm-close-modal'),
+  confirmCloseCancel: document.getElementById('confirm-close-cancel'),
+  confirmCloseOk: document.getElementById('confirm-close-ok')
 };
 
 // ==========================================================================
@@ -850,13 +855,13 @@ function renderMembers() {
               ${isAdmin ? ICONS.crown + ' Admin' : ICONS.user + ' Member'}
             </div>
           `}
+          ${showActions ? `
+            <div class="sidebar-member-actions">
+              <button class="btn-promote" onclick="promoteMember('${member.id}')">Promote</button>
+              <button class="btn-kick" onclick="kickMember('${member.id}')">Remove</button>
+            </div>
+          ` : ''}
         </div>
-        ${showActions ? `
-          <div class="sidebar-member-actions">
-            <button class="btn-promote" onclick="promoteMember('${member.id}')">Promote</button>
-            <button class="btn-kick" onclick="kickMember('${member.id}')">Remove</button>
-          </div>
-        ` : ''}
       </div>
     `;
   }).join('');
@@ -1014,12 +1019,20 @@ function promoteMember(memberId) {
 }
 
 function closeRoom() {
-  if (confirm('Are you sure you want to close this room? All members will be disconnected.')) {
-    state.socket.emit('room:close', {}, (response) => {
-      resetRoomState();
-      showScreen('home');
-    });
-  }
+  // Show themed confirmation dialog instead of browser confirm()
+  elements.confirmCloseModal.classList.remove('hidden');
+}
+
+function confirmCloseRoom() {
+  elements.confirmCloseModal.classList.add('hidden');
+  state.socket.emit('room:close', {}, (response) => {
+    resetRoomState();
+    showScreen('home');
+  });
+}
+
+function cancelCloseRoom() {
+  elements.confirmCloseModal.classList.add('hidden');
 }
 
 function sendTypingStart() {
@@ -1307,6 +1320,15 @@ function setupEventListeners() {
     hideOverlays();
     resetRoomState();
     showScreen('home');
+  });
+
+  // Confirm Close Modal
+  elements.confirmCloseCancel.addEventListener('click', cancelCloseRoom);
+  elements.confirmCloseOk.addEventListener('click', confirmCloseRoom);
+  elements.confirmCloseModal.addEventListener('click', (e) => {
+    if (e.target === elements.confirmCloseModal) {
+      cancelCloseRoom();
+    }
   });
 }
 
