@@ -1,48 +1,38 @@
 #!/usr/bin/env node
 // =============================================================================
-// ChitChat Status Aggregator
+// ChitChat Status Aggregator - Oracle VM Single Instance
 // =============================================================================
-// Runs on Oracle VM (load balancer) to provide overall system status
-// Usage: node status-aggregator.js
+// Provides overall system status for single PM2 instance setup
+// Usage: node status-aggregator.cjs
 // Endpoint: http://localhost:3001/api/status
 //
 // Environment Variables:
 //   STATUS_PORT     - Port to listen on (default: 3001)
-//   BACKEND_SERVERS - Comma-separated list of backend servers
-//                     Format: id:host:port,id:host:port
-//                     Example: azure-vm-1:52.230.91.238:3000,azure-vm-2:4.194.203.184:3000
+//   BACKEND_HOST    - Backend server host (default: 127.0.0.1)
+//   BACKEND_PORT    - Backend server port (default: 3000)
 // =============================================================================
 
 const http = require('http');
 
 const PORT = process.env.STATUS_PORT || 3001;
+const BACKEND_HOST = process.env.BACKEND_HOST || '127.0.0.1';
+const BACKEND_PORT = process.env.BACKEND_PORT || 3000;
 
-// Parse backend servers from environment variable
-function parseBackends() {
-  const envBackends = process.env.BACKEND_SERVERS;
-  if (!envBackends) {
-    console.error('ERROR: BACKEND_SERVERS environment variable not set');
-    console.error('Example: BACKEND_SERVERS=vm1:192.168.1.1:3000,vm2:192.168.1.2:3000');
-    process.exit(1);
-  }
-
-  return envBackends.split(',').map((server) => {
-    const [id, host, port] = server.trim().split(':');
-    return { id, host, port: parseInt(port, 10) };
-  });
-}
-
-const BACKENDS = parseBackends();
+const BACKEND = {
+  id: 'oracle-vm',
+  host: BACKEND_HOST,
+  port: parseInt(BACKEND_PORT, 10)
+};
 
 // Fetch server info with timeout
-function fetchServerInfo(backend) {
+function fetchServerInfo() {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
-      resolve({ serverId: backend.id, status: 'unreachable', error: 'timeout' });
+      resolve({ serverId: BACKEND.id, status: 'unreachable', error: 'timeout' });
     }, 3000);
 
     const req = http.get(
-      `http://${backend.host}:${backend.port}/api/server-info`,
+      `http://${BACKEND.host}:${BACKEND.port}/api/server-info`,
       (res) => {
         let data = '';
         res.on('data', (chunk) => (data += chunk));
@@ -51,7 +41,7 @@ function fetchServerInfo(backend) {
           try {
             resolve(JSON.parse(data));
           } catch (e) {
-            resolve({ serverId: backend.id, status: 'error', error: 'invalid response' });
+            resolve({ serverId: BACKEND.id, status: 'error', error: 'invalid response' });
           }
         });
       }
@@ -59,7 +49,7 @@ function fetchServerInfo(backend) {
 
     req.on('error', () => {
       clearTimeout(timeout);
-      resolve({ serverId: backend.id, status: 'unreachable', error: 'connection failed' });
+      resolve({ serverId: BACKEND.id, status: 'unreachable', error: 'connection failed' });
     });
 
     req.end();
@@ -75,44 +65,59 @@ function getNginxStatus() {
   });
 }
 
+// Get Redis status
+function getRedisStatus() {
+  return new Promise((resolve) => {
+    require('child_process').exec('redis-cli ping 2>/dev/null', (err, stdout) => {
+      resolve(stdout.trim() === 'PONG');
+    });
+  });
+}
+
 // Main handler
 async function handleStatus(req, res) {
   const startTime = Date.now();
 
-  // Fetch all backend statuses in parallel
-  const backendStatuses = await Promise.all(BACKENDS.map(fetchServerInfo));
+  // Fetch backend status
+  const backendStatus = await fetchServerInfo();
 
-  // Get nginx status
-  const nginxActive = await getNginxStatus();
+  // Get nginx and Redis status
+  const [nginxActive, redisActive] = await Promise.all([
+    getNginxStatus(),
+    getRedisStatus()
+  ]);
 
-  // Aggregate
-  const healthyBackends = backendStatuses.filter((b) => b.status === 'healthy').length;
-  const totalClients = backendStatuses.reduce((sum, b) => sum + (b.clients || 0), 0);
-  const totalRooms = backendStatuses.length > 0 ? backendStatuses[0].rooms || 0 : 0; // Redis is shared
-
+  // Overall status
+  const isHealthy = backendStatus.status === 'healthy' && nginxActive && redisActive;
   let overallStatus = 'healthy';
-  if (healthyBackends === 0) overallStatus = 'down';
-  else if (healthyBackends < BACKENDS.length) overallStatus = 'degraded';
-  if (!nginxActive) overallStatus = 'down';
+  if (!nginxActive || !redisActive || backendStatus.status === 'unreachable') {
+    overallStatus = 'down';
+  } else if (backendStatus.status !== 'healthy') {
+    overallStatus = 'degraded';
+  }
 
   const status = {
     status: overallStatus,
+    deployment: 'oracle-vm-single',
     loadBalancer: {
       host: 'oracle-vm',
       nginx: nginxActive ? 'running' : 'stopped',
     },
-    backends: backendStatuses.map((b) => ({
-      id: b.serverId,
-      status: b.status,
-      uptime: b.uptime ? `${Math.floor(b.uptime / 60)}m` : null,
-      memory: b.memory ? `${b.memory}MB` : null,
-      redis: b.redis?.connected ? `${b.redis.latency}ms` : 'disconnected',
-      clients: b.clients || 0,
-    })),
+    backend: {
+      id: backendStatus.serverId,
+      status: backendStatus.status,
+      uptime: backendStatus.uptime ? `${Math.floor(backendStatus.uptime / 60)}m` : null,
+      memory: backendStatus.memory ? `${backendStatus.memory}MB` : null,
+      clients: backendStatus.clients || 0,
+    },
+    redis: {
+      status: redisActive ? 'running' : 'stopped',
+      connected: backendStatus.redis?.connected || false,
+      latency: backendStatus.redis?.latency || null,
+    },
     summary: {
-      healthyBackends: `${healthyBackends}/${BACKENDS.length}`,
-      totalClients,
-      activeRooms: totalRooms,
+      activeRooms: backendStatus.rooms || 0,
+      totalClients: backendStatus.clients || 0,
     },
     timestamp: new Date().toISOString(),
     responseTime: `${Date.now() - startTime}ms`,
@@ -137,5 +142,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Status aggregator running on port ${PORT}`);
-  console.log(`Monitoring backends: ${BACKENDS.map((b) => b.host).join(', ')}`);
+  console.log(`Monitoring backend: ${BACKEND.host}:${BACKEND.port}`);
 });

@@ -32,6 +32,8 @@
 
 ## Architecture
 
+### Production (Oracle VM - Free Tier)
+
 ```
                          ┌─────────────────────────────────────┐
                          │              Users                  │
@@ -55,27 +57,35 @@
                                  └────────┬────────┘
                                           │
                                           ▼
-                                 ┌─────────────────┐
-                                 │   Oracle VM     │
-                                 │   (nginx LB)    │
-                                 └────────┬────────┘
-                                          │
-                          ┌───────────────┴───────────────┐
-                          │                               │
-                          ▼                               ▼
-                 ┌─────────────────┐             ┌─────────────────┐
-                 │   Azure VM 1    │             │   Azure VM 2    │
-                 │   (App Server)  │             │   (App Server)  │
-                 └────────┬────────┘             └────────┬────────┘
-                          │                               │
-                          └───────────────┬───────────────┘
-                                          │
-                                          ▼
-                                 ┌─────────────────┐
-                                 │  Azure Redis    │
-                                 │  (Shared State) │
-                                 └─────────────────┘
+                        ┌─────────────────────────────────┐
+                        │         Oracle VM (Free)        │
+                        │                                 │
+                        │  ┌──────────────────────────┐   │
+                        │  │    Nginx (Port 443)      │   │
+                        │  │   Load Balancer + SSL    │   │
+                        │  └────────┬─────────────────┘   │
+                        │           │                     │
+                        │  ┌────────┴─────────────────┐   │
+                        │  │  PM2 Process Manager     │   │
+                        │  ├──────────────────────────┤   │
+                        │  │  ├─ App Instance :3000   │   │
+                        │  │  ├─ App Instance :3001   │   │
+                        │  │  └─ App Instance :3002   │   │
+                        │  └────────┬─────────────────┘   │
+                        │           │                     │
+                        │  ┌────────▼─────────────────┐   │
+                        │  │   Redis (localhost)      │   │
+                        │  │  Persistent Storage      │   │
+                        │  └──────────────────────────┘   │
+                        └─────────────────────────────────┘
 ```
+
+**Benefits:**
+- ✅ **100% Free** - Oracle Always Free tier
+- ✅ **High Availability** - 3 app instances with auto-failover
+- ✅ **Persistent State** - Redis with AOF (auto-restore on reboot)
+- ✅ **Auto-restart** - PM2 manages process lifecycle
+- ✅ **Zero Maintenance** - No external dependencies
 
 ### Access URLs
 
@@ -193,6 +203,59 @@ npm run smoke
 
 ## Deployment
 
+### Production Setup (Oracle VM)
+
+Deploy the entire stack on a single Oracle Cloud VM (Always Free tier):
+
+```bash
+# 1. SSH to your Oracle VM
+ssh ubuntu@your-oracle-vm-ip
+
+# 2. Clone repository
+git clone https://github.com/KasunCSB/chit-chat.git
+cd chit-chat
+
+# 3. Run automated deployment script
+chmod +x deploy-oracle.sh
+sudo ./deploy-oracle.sh
+```
+
+The script will:
+- ✅ Install Node.js, Redis, Nginx, PM2
+- ✅ Configure Redis with AOF persistence
+- ✅ Deploy 3 Node.js instances (ports 3000-3002)
+- ✅ Set up nginx load balancer
+- ✅ Configure auto-restart on reboot
+
+**Manual Deployment** (if preferred):
+
+```bash
+# Install dependencies
+sudo apt update
+sudo apt install -y nodejs npm redis-server nginx
+
+# Configure Redis persistence
+sudo sed -i 's/^appendonly no/appendonly yes/' /etc/redis/redis.conf
+sudo systemctl restart redis-server
+
+# Install app dependencies
+npm ci --production
+
+# Copy environment config
+cp .env.oracle .env
+
+# Start with PM2
+npm install -g pm2
+pm2 start ecosystem.config.cjs --env production
+pm2 save
+pm2 startup
+
+# Configure nginx
+sudo cp nginx-oracle.conf /etc/nginx/sites-available/cc.kasunc.live
+sudo ln -s /etc/nginx/sites-available/cc.kasunc.live /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
 ### Production Stack
 
 | Component | Service |
@@ -200,22 +263,12 @@ npm run smoke
 | Frontend | Firebase Hosting (`chit-chat-g7.web.app`) |
 | Edge/SSL | Cloudflare (Free tier, Full strict) |
 | Load Balancer | nginx on Oracle Cloud VM |
-| App Servers | 2x Azure VMs (round-robin) |
-| Session Store | Azure Cache for Redis (Standard C0, TLS) |
-| Health Monitor | Status Aggregator on Oracle VM (PM2) |
+| App Servers | 3x processes via PM2 (ports 3000-3002) |
+| Session Store | Redis (localhost, AOF persistence) |
+| Compute | Oracle Cloud Always Free (AMD VM) |
 | Domain | `cc.kasunc.live` (Cloudflare DNS) |
 
-### Deploy to VMs
-
-```bash
-# On each VM:
-git clone https://github.com/KasunCSB/chit-chat.git
-cd chit-chat
-npm ci --production
-cp .env.example .env
-# Edit .env with production values
-npm start
-```
+**Cost:** $0/month (100% free)
 
 ### Deploy Frontend
 
